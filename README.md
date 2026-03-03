@@ -17,7 +17,7 @@ Apache License 2.0. See [LICENSE](./LICENSE).
 GitHub Actions workflows are included for:
 - Lint, test, and build on PRs and pushes to `main`
 - Conventional Commit-style PR title validation
-- Automatic semantic version tags from Conventional Commits on `main`
+- Automatic semantic version tags from Conventional Commits on `main`, with GoReleaser publishing on newly created tags
 - Tagged release builds for Linux/macOS/Windows via GoReleaser with checksums
 
 ## Build

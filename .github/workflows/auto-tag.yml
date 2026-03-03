@@ -26,3 +26,26 @@ jobs:
           default_bump: patch
           release_branches: main
           create_annotated_tag: true
+
+      - name: Setup Go
+        if: steps.tag_version.outputs.new_tag != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Checkout new tag
+        if: steps.tag_version.outputs.new_tag != ''
+        run: |
+          git fetch --force --tags origin
+          git checkout "refs/tags/${{ steps.tag_version.outputs.new_tag }}"
+
+      - name: Publish release with GoReleaser
+        if: steps.tag_version.outputs.new_tag != ''
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
