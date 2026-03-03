@@ -12,6 +12,14 @@ It supports:
 
 Apache License 2.0. See [LICENSE](./LICENSE).
 
+## CI/CD
+
+GitHub Actions workflows are included for:
+- Lint, test, and build on PRs and pushes to `main`
+- Conventional Commit-style PR title validation
+- Automatic release PRs/tags via `release-please` (based on conventional commits)
+- Tagged release builds for Linux/macOS/Windows with uploaded binaries
+
 ## Build
 
 ```bash
