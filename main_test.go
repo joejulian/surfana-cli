@@ -199,6 +199,26 @@ func TestDiscoverOIDCMalformedURL(t *testing.T) {
 	}
 }
 
+func TestResolveLoginProfileLoginHintMerge(t *testing.T) {
+	t.Parallel()
+
+	p, err := resolveLoginProfile(context.Background(), profileConfig{
+		GrafanaURL: "https://grafana.example.com",
+		IssuerURL:  "https://idp.example.com",
+		ClientID:   "client",
+		LoginHint:  "old@example.com",
+	}, loginResolveInput{
+		LoginHint: "new@example.com",
+		Discover:  false,
+	}, http.DefaultClient, func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("resolveLoginProfile returned error: %v", err)
+	}
+	if p.LoginHint != "new@example.com" {
+		t.Fatalf("expected login hint override, got %q", p.LoginHint)
+	}
+}
+
 func TestDeriveIssuerCandidateFromAuthURLOkta(t *testing.T) {
 	t.Parallel()
 
@@ -302,7 +322,8 @@ func TestLoginIntegrationAutoDiscovery(t *testing.T) {
 	http.DefaultClient = srv.Client()
 	defer func() { http.DefaultClient = oldClient }()
 
-	err := cmdLogin([]string{
+	err := executeWithArgs([]string{
+		"login",
 		"--profile", "itest",
 		"--grafana-url", srv.URL,
 		"--method", "device",

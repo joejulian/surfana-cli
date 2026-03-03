@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -19,7 +17,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -43,6 +40,7 @@ type profileConfig struct {
 	IssuerURL    string   `json:"issuer_url"`
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret,omitempty"`
+	LoginHint    string   `json:"login_hint,omitempty"`
 	Scopes       []string `json:"scopes"`
 	Audience     string   `json:"audience,omitempty"`
 	IssuerSource string   `json:"issuer_source,omitempty"`
@@ -105,6 +103,7 @@ type loginResolveInput struct {
 	IssuerURL         string
 	ClientID          string
 	ClientSecret      string
+	LoginHint         string
 	Audience          string
 	Scope             string
 	ScopeProvided     bool
@@ -116,294 +115,10 @@ type loginResolveInput struct {
 }
 
 func main() {
-	if err := run(); err != nil {
+	if err := execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func run() error {
-	if len(os.Args) < 2 {
-		printUsage()
-		return nil
-	}
-
-	switch os.Args[1] {
-	case "login":
-		return cmdLogin(os.Args[2:])
-	case "api":
-		return cmdAPI(os.Args[2:])
-	case "whoami":
-		return cmdWhoAmI(os.Args[2:])
-	case "logout":
-		return cmdLogout(os.Args[2:])
-	case "profiles":
-		return cmdProfiles(os.Args[2:])
-	case "help", "-h", "--help":
-		printUsage()
-		return nil
-	default:
-		return fmt.Errorf("unknown command %q", os.Args[1])
-	}
-}
-
-func printUsage() {
-	fmt.Printf(`%s: Grafana CLI with OIDC auth\n\n`, appName)
-	fmt.Println("Usage:")
-	fmt.Println("  surfana login [flags]")
-	fmt.Println("  surfana api [flags] <path>")
-	fmt.Println("  surfana whoami [flags]")
-	fmt.Println("  surfana logout [flags]")
-	fmt.Println("  surfana profiles")
-	fmt.Println()
-	fmt.Println("Run 'surfana <command> -h' for details.")
-}
-
-func cmdLogin(args []string) error {
-	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-
-	profile := fs.String("profile", defaultProfile, "profile name")
-	grafanaURL := fs.String("grafana-url", "", "Grafana base URL")
-	issuerURL := fs.String("issuer-url", "", "OIDC issuer URL")
-	clientID := fs.String("client-id", "", "OIDC client ID")
-	clientSecret := fs.String("client-secret", "", "OIDC client secret")
-	audience := fs.String("audience", "", "OIDC audience")
-	scope := fs.String("scope", "", "space separated scopes")
-	method := fs.String("method", "device", "auth method: device or authcode")
-	openBrowser := fs.Bool("open-browser", true, "open browser for sign in")
-	discover := fs.Bool("discover", true, "auto-discover OIDC issuer and client from Grafana URL")
-	discoverTimeout := fs.Duration("discover-timeout", 10*time.Second, "timeout for OIDC auto-discovery")
-	debug := fs.Bool("debug", false, "print debug output")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	if cfg.Profiles == nil {
-		cfg.Profiles = map[string]profileConfig{}
-	}
-
-	existing := cfg.Profiles[*profile]
-
-	debugf := func(format string, a ...any) {
-		if *debug {
-			fmt.Fprintf(os.Stderr, "debug: "+format+"\n", a...)
-		}
-	}
-
-	p, err := resolveLoginProfile(context.Background(), existing, loginResolveInput{
-		GrafanaURL:       *grafanaURL,
-		IssuerURL:        *issuerURL,
-		ClientID:         *clientID,
-		ClientSecret:     *clientSecret,
-		Audience:         *audience,
-		Scope:            *scope,
-		ScopeProvided:    flagWasProvided(fs, "scope"),
-		IssuerProvided:   flagWasProvided(fs, "issuer-url"),
-		ClientIDProvided: flagWasProvided(fs, "client-id"),
-		Discover:         *discover,
-		DiscoverTimeout:  *discoverTimeout,
-	}, http.DefaultClient, debugf)
-	if err != nil {
-		return err
-	}
-
-	meta, err := discoverProviderMetadata(p.IssuerURL)
-	if err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-	var tok *storedToken
-	switch *method {
-	case "device":
-		tok, err = loginDeviceFlow(ctx, p, meta, *openBrowser)
-	case "authcode":
-		tok, err = loginAuthCodeFlow(ctx, p, meta, *openBrowser)
-	default:
-		return fmt.Errorf("unsupported login method %q", *method)
-	}
-	if err != nil {
-		return err
-	}
-
-	cfg.CurrentProfile = *profile
-	cfg.Profiles[*profile] = p
-	if err := saveConfig(cfg); err != nil {
-		return err
-	}
-	if err := saveToken(*profile, tok); err != nil {
-		return err
-	}
-
-	fmt.Printf("login succeeded for profile %q\n", *profile)
-	return nil
-}
-
-func cmdAPI(args []string) error {
-	fs := flag.NewFlagSet("api", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	profile := fs.String("profile", "", "profile name")
-	method := fs.String("X", "GET", "HTTP method")
-	body := fs.String("d", "", "request body")
-	contentType := fs.String("content-type", "application/json", "request content-type")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 1 {
-		return errors.New("api requires one path argument, e.g. /api/user")
-	}
-	path := fs.Arg(0)
-
-	cfg, pName, p, err := resolveProfile(*profile)
-	if err != nil {
-		return err
-	}
-	_ = cfg
-
-	meta, err := discoverProviderMetadata(p.IssuerURL)
-	if err != nil {
-		return err
-	}
-
-	tok, err := loadToken(pName)
-	if err != nil {
-		return err
-	}
-
-	tok, changed, err := ensureValidToken(context.Background(), p, meta, tok)
-	if err != nil {
-		return err
-	}
-	if changed {
-		if err := saveToken(pName, tok); err != nil {
-			return err
-		}
-	}
-
-	fullURL, err := joinURLPath(p.GrafanaURL, path)
-	if err != nil {
-		return err
-	}
-
-	var reqBody io.Reader
-	if *body != "" {
-		reqBody = strings.NewReader(*body)
-	}
-	req, err := http.NewRequest(strings.ToUpper(*method), fullURL, reqBody)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	req.Header.Set("User-Agent", defaultUserAgent)
-	if *body != "" {
-		req.Header.Set("Content-Type", *contentType)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("HTTP %d\n", resp.StatusCode)
-	if len(respBytes) == 0 {
-		return nil
-	}
-
-	var pretty bytes.Buffer
-	if json.Indent(&pretty, respBytes, "", "  ") == nil {
-		fmt.Println(pretty.String())
-	} else {
-		fmt.Println(string(respBytes))
-	}
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("request failed with HTTP %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func cmdWhoAmI(args []string) error {
-	fs := flag.NewFlagSet("whoami", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	profile := fs.String("profile", "", "profile name")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, pName, p, err := resolveProfile(*profile)
-	if err != nil {
-		return err
-	}
-	_ = p
-
-	tok, err := loadToken(pName)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("profile: %s\n", pName)
-	fmt.Printf("grafana: %s\n", cfg.Profiles[pName].GrafanaURL)
-	fmt.Printf("token_type: %s\n", tok.TokenType)
-	fmt.Printf("expires_at: %s\n", tok.Expiry.Format(time.RFC3339))
-	fmt.Printf("has_refresh_token: %t\n", tok.RefreshToken != "")
-	return nil
-}
-
-func cmdLogout(args []string) error {
-	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	profile := fs.String("profile", "", "profile name")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	_, pName, _, err := resolveProfile(*profile)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(tokenPath(pName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	fmt.Printf("logged out profile %q\n", pName)
-	return nil
-}
-
-func cmdProfiles(args []string) error {
-	if len(args) > 0 {
-		return errors.New("profiles does not take arguments")
-	}
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	if len(cfg.Profiles) == 0 {
-		fmt.Println("no profiles configured")
-		return nil
-	}
-	names := make([]string, 0, len(cfg.Profiles))
-	for name := range cfg.Profiles {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		marker := " "
-		if name == cfg.CurrentProfile {
-			marker = "*"
-		}
-		fmt.Printf("%s %s\n", marker, name)
-	}
-	return nil
 }
 
 func resolveLoginProfile(ctx context.Context, existing profileConfig, in loginResolveInput, client *http.Client, debugf func(string, ...any)) (profileConfig, error) {
@@ -412,6 +127,7 @@ func resolveLoginProfile(ctx context.Context, existing profileConfig, in loginRe
 		IssuerURL:    chooseNonEmpty(in.IssuerURL, existing.IssuerURL),
 		ClientID:     chooseNonEmpty(in.ClientID, existing.ClientID),
 		ClientSecret: chooseNonEmpty(in.ClientSecret, existing.ClientSecret),
+		LoginHint:    chooseNonEmpty(in.LoginHint, existing.LoginHint),
 		Audience:     chooseNonEmpty(in.Audience, existing.Audience),
 	}
 
@@ -846,6 +562,9 @@ func loginDeviceFlow(ctx context.Context, p profileConfig, meta providerMetadata
 	if p.Audience != "" {
 		values.Set("audience", p.Audience)
 	}
+	if p.LoginHint != "" {
+		values.Set("login_hint", p.LoginHint)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, meta.DeviceAuthorizationEndpoint, strings.NewReader(values.Encode()))
 	if err != nil {
@@ -995,6 +714,16 @@ func loginAuthCodeFlow(ctx context.Context, p profileConfig, meta providerMetada
 		}
 		q := u.Query()
 		q.Set("audience", p.Audience)
+		u.RawQuery = q.Encode()
+		authURL = u.String()
+	}
+	if p.LoginHint != "" {
+		u, err := url.Parse(authURL)
+		if err != nil {
+			return nil, err
+		}
+		q := u.Query()
+		q.Set("login_hint", p.LoginHint)
 		u.RawQuery = q.Encode()
 		authURL = u.String()
 	}
@@ -1250,16 +979,6 @@ func chooseNonEmpty(first, fallback string) string {
 		return strings.TrimSpace(first)
 	}
 	return strings.TrimSpace(fallback)
-}
-
-func flagWasProvided(fs *flag.FlagSet, name string) bool {
-	provided := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			provided = true
-		}
-	})
-	return provided
 }
 
 func splitScopes(v string) []string {

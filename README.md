@@ -35,7 +35,15 @@ go build -o surfana ./...
   --grafana-url https://grafana.example.com
 ```
 
-2. Manual overrides (if discovery cannot determine everything):
+2. Optional IdP user hint (useful for Okta/SAML-fronted login):
+
+```bash
+./surfana login \
+  --grafana-url https://grafana.example.com \
+  --login-hint my.email@domain.com
+```
+
+3. Manual overrides (if discovery cannot determine everything):
 
 ```bash
 ./surfana login \
@@ -44,13 +52,13 @@ go build -o surfana ./...
   --client-id YOUR_CLIENT_ID
 ```
 
-3. Query Grafana API:
+4. Query Grafana API:
 
 ```bash
 ./surfana api /api/user
 ```
 
-4. Check session details:
+5. Check session details:
 
 ```bash
 ./surfana whoami
@@ -66,6 +74,7 @@ go build -o surfana ./...
     - `--issuer-url`
     - `--client-id`
     - `--client-secret` (optional)
+    - `--login-hint` (optional, for example `my.email@domain.com`)
     - `--audience` (optional)
     - `--scope` (default fallback: `openid profile email`)
     - `--method` (`device` or `authcode`, default: `device`)
