@@ -28,23 +28,29 @@ go build -o surfana ./...
 
 ## Quick start
 
-1. Log in with OIDC device flow:
+1. Log in with discovery-first flow:
+
+```bash
+./surfana login \
+  --grafana-url https://grafana.example.com
+```
+
+2. Manual overrides (if discovery cannot determine everything):
 
 ```bash
 ./surfana login \
   --grafana-url https://grafana.example.com \
   --issuer-url https://idp.example.com \
-  --client-id YOUR_CLIENT_ID \
-  --scope "openid profile email offline_access"
+  --client-id YOUR_CLIENT_ID
 ```
 
-2. Query Grafana API:
+3. Query Grafana API:
 
 ```bash
 ./surfana api /api/user
 ```
 
-3. Check session details:
+4. Check session details:
 
 ```bash
 ./surfana whoami
@@ -61,9 +67,12 @@ go build -o surfana ./...
     - `--client-id`
     - `--client-secret` (optional)
     - `--audience` (optional)
-    - `--scope` (default: `openid profile email`)
+    - `--scope` (default fallback: `openid profile email`)
     - `--method` (`device` or `authcode`, default: `device`)
     - `--open-browser` (default: `true`)
+    - `--discover` (default: `true`)
+    - `--discover-timeout` (default: `10s`)
+    - `--debug` (prints discovery and selection diagnostics)
 
 - `surfana api [flags] <path>`
   - Executes authenticated requests against Grafana
@@ -92,3 +101,12 @@ If your deployment only supports browser cookie sessions, this CLI can still com
 
 - Config and token files are written with `0600` permissions.
 - Tokens are stored plaintext on disk; use OS-level disk encryption or secrets tooling where required by policy.
+- OIDC auto-discovery trusts HTTPS endpoints only.
+
+## Troubleshooting Discovery
+
+- If discovery only finds one value, provide the other manually:
+  - `--issuer-url https://idp.example.com`
+  - `--client-id YOUR_CLIENT_ID`
+- Use `--debug` to print discovery steps (visited URLs, redirect chain, selected issuer/client sources).
+- Increase `--discover-timeout` for slow auth gateways.

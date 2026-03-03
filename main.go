@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -29,6 +30,7 @@ const (
 	appName          = "surfana"
 	defaultProfile   = "default"
 	defaultUserAgent = "surfana-cli/0.1"
+	defaultScope     = "openid profile email"
 )
 
 type appConfig struct {
@@ -43,6 +45,10 @@ type profileConfig struct {
 	ClientSecret string   `json:"client_secret,omitempty"`
 	Scopes       []string `json:"scopes"`
 	Audience     string   `json:"audience,omitempty"`
+	IssuerSource string   `json:"issuer_source,omitempty"`
+	ClientSource string   `json:"client_source,omitempty"`
+	ScopesSource string   `json:"scopes_source,omitempty"`
+	DiscoverUsed bool     `json:"discover_used,omitempty"`
 }
 
 type storedToken struct {
@@ -72,6 +78,34 @@ type deviceAuthResponse struct {
 type tokenErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+}
+
+type oidcDiscoveryOptions struct {
+	Timeout      time.Duration
+	MaxRedirects int
+	AllowHTTP    bool
+	Debug        bool
+}
+
+type oidcDiscoveryResult struct {
+	IssuerURL string
+	ClientID  string
+	Scopes    []string
+}
+
+type loginResolveInput struct {
+	GrafanaURL        string
+	IssuerURL         string
+	ClientID          string
+	ClientSecret      string
+	Audience          string
+	Scope             string
+	ScopeProvided     bool
+	IssuerProvided    bool
+	ClientIDProvided  bool
+	Discover          bool
+	DiscoverTimeout   time.Duration
+	DiscoverAllowHTTP bool
 }
 
 func main() {
@@ -128,9 +162,12 @@ func cmdLogin(args []string) error {
 	clientID := fs.String("client-id", "", "OIDC client ID")
 	clientSecret := fs.String("client-secret", "", "OIDC client secret")
 	audience := fs.String("audience", "", "OIDC audience")
-	scope := fs.String("scope", "openid profile email", "space separated scopes")
+	scope := fs.String("scope", "", "space separated scopes")
 	method := fs.String("method", "device", "auth method: device or authcode")
 	openBrowser := fs.Bool("open-browser", true, "open browser for sign in")
+	discover := fs.Bool("discover", true, "auto-discover OIDC issuer and client from Grafana URL")
+	discoverTimeout := fs.Duration("discover-timeout", 10*time.Second, "timeout for OIDC auto-discovery")
+	debug := fs.Bool("debug", false, "print debug output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -144,20 +181,28 @@ func cmdLogin(args []string) error {
 	}
 
 	existing := cfg.Profiles[*profile]
-	p := profileConfig{
-		GrafanaURL:   chooseNonEmpty(*grafanaURL, existing.GrafanaURL),
-		IssuerURL:    chooseNonEmpty(*issuerURL, existing.IssuerURL),
-		ClientID:     chooseNonEmpty(*clientID, existing.ClientID),
-		ClientSecret: chooseNonEmpty(*clientSecret, existing.ClientSecret),
-		Scopes:       splitScopes(chooseNonEmpty(*scope, strings.Join(existing.Scopes, " "))),
-		Audience:     chooseNonEmpty(*audience, existing.Audience),
+
+	debugf := func(format string, a ...any) {
+		if *debug {
+			fmt.Fprintf(os.Stderr, "debug: "+format+"\n", a...)
+		}
 	}
 
-	if p.GrafanaURL == "" || p.IssuerURL == "" || p.ClientID == "" {
-		return errors.New("login requires grafana-url, issuer-url, and client-id (or existing profile values)")
-	}
-	if len(p.Scopes) == 0 {
-		p.Scopes = []string{"openid", "profile", "email"}
+	p, err := resolveLoginProfile(context.Background(), existing, loginResolveInput{
+		GrafanaURL:       *grafanaURL,
+		IssuerURL:        *issuerURL,
+		ClientID:         *clientID,
+		ClientSecret:     *clientSecret,
+		Audience:         *audience,
+		Scope:            *scope,
+		ScopeProvided:    flagWasProvided(fs, "scope"),
+		IssuerProvided:   flagWasProvided(fs, "issuer-url"),
+		ClientIDProvided: flagWasProvided(fs, "client-id"),
+		Discover:         *discover,
+		DiscoverTimeout:  *discoverTimeout,
+	}, http.DefaultClient, debugf)
+	if err != nil {
+		return err
 	}
 
 	meta, err := discoverProviderMetadata(p.IssuerURL)
@@ -352,6 +397,363 @@ func cmdProfiles(args []string) error {
 		fmt.Printf("%s %s\n", marker, name)
 	}
 	return nil
+}
+
+func resolveLoginProfile(ctx context.Context, existing profileConfig, in loginResolveInput, client *http.Client, debugf func(string, ...any)) (profileConfig, error) {
+	p := profileConfig{
+		GrafanaURL:   chooseNonEmpty(in.GrafanaURL, existing.GrafanaURL),
+		IssuerURL:    chooseNonEmpty(in.IssuerURL, existing.IssuerURL),
+		ClientID:     chooseNonEmpty(in.ClientID, existing.ClientID),
+		ClientSecret: chooseNonEmpty(in.ClientSecret, existing.ClientSecret),
+		Audience:     chooseNonEmpty(in.Audience, existing.Audience),
+	}
+
+	switch {
+	case strings.TrimSpace(in.IssuerURL) != "":
+		p.IssuerSource = "flag"
+	case strings.TrimSpace(existing.IssuerURL) != "":
+		p.IssuerSource = "profile"
+	}
+	switch {
+	case strings.TrimSpace(in.ClientID) != "":
+		p.ClientSource = "flag"
+	case strings.TrimSpace(existing.ClientID) != "":
+		p.ClientSource = "profile"
+	}
+
+	if in.ScopeProvided {
+		p.Scopes = splitScopes(in.Scope)
+		p.ScopesSource = "flag"
+	} else if len(existing.Scopes) > 0 {
+		p.Scopes = append([]string(nil), existing.Scopes...)
+		p.ScopesSource = "profile"
+	}
+
+	needsDiscovery := in.Discover && p.GrafanaURL != "" && (p.IssuerURL == "" || p.ClientID == "" || len(p.Scopes) == 0)
+	if needsDiscovery {
+		debugf("starting oidc discovery from grafana-url=%s", p.GrafanaURL)
+		res, err := discoverOIDCFromGrafana(ctx, client, p.GrafanaURL, oidcDiscoveryOptions{
+			Timeout:      in.DiscoverTimeout,
+			MaxRedirects: 10,
+			AllowHTTP:    in.DiscoverAllowHTTP,
+			Debug:        false,
+		}, debugf)
+		if err != nil {
+			return profileConfig{}, err
+		}
+		p.DiscoverUsed = true
+		if p.ClientID == "" && res.ClientID != "" {
+			p.ClientID = res.ClientID
+			p.ClientSource = "discovered"
+		}
+		if p.IssuerURL == "" && res.IssuerURL != "" {
+			p.IssuerURL = res.IssuerURL
+			p.IssuerSource = "discovered"
+		}
+		if len(p.Scopes) == 0 && len(res.Scopes) > 0 {
+			p.Scopes = append([]string(nil), res.Scopes...)
+			p.ScopesSource = "discovered"
+		}
+	}
+
+	if len(p.Scopes) == 0 {
+		p.Scopes = splitScopes(defaultScope)
+		p.ScopesSource = "default"
+	}
+
+	if p.GrafanaURL == "" || p.IssuerURL == "" || p.ClientID == "" {
+		if !in.Discover {
+			return profileConfig{}, errors.New("login requires grafana-url, issuer-url, and client-id (or existing profile values); enable --discover or provide missing flags")
+		}
+		found := []string{}
+		missing := []string{}
+		if p.GrafanaURL != "" {
+			found = append(found, fmt.Sprintf("grafana_url=%s", p.GrafanaURL))
+		} else {
+			missing = append(missing, "grafana_url")
+		}
+		if p.ClientID != "" {
+			found = append(found, fmt.Sprintf("client_id=%s", p.ClientID))
+		} else {
+			missing = append(missing, "client_id")
+		}
+		if p.IssuerURL != "" {
+			found = append(found, fmt.Sprintf("issuer_url=%s", p.IssuerURL))
+		} else {
+			missing = append(missing, "issuer_url")
+		}
+		return profileConfig{}, fmt.Errorf(
+			"failed to auto-discover OIDC config from %s: found %s, missing %s; rerun with --issuer-url and/or --client-id (use --debug for diagnostics)",
+			chooseNonEmpty(p.GrafanaURL, "<unset>"),
+			strings.Join(found, ", "),
+			strings.Join(missing, ", "),
+		)
+	}
+
+	debugf("selected issuer_url=%s (source=%s)", p.IssuerURL, chooseNonEmpty(p.IssuerSource, "unknown"))
+	debugf("selected client_id=%s (source=%s)", p.ClientID, chooseNonEmpty(p.ClientSource, "unknown"))
+	debugf("selected scopes=%s (source=%s)", strings.Join(p.Scopes, " "), chooseNonEmpty(p.ScopesSource, "unknown"))
+	return p, nil
+}
+
+func discoverOIDCFromGrafana(ctx context.Context, client *http.Client, grafanaURL string, opts oidcDiscoveryOptions, debugf func(string, ...any)) (oidcDiscoveryResult, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 10 * time.Second
+	}
+	if opts.MaxRedirects <= 0 {
+		opts.MaxRedirects = 10
+	}
+
+	base, err := url.Parse(grafanaURL)
+	if err != nil {
+		return oidcDiscoveryResult{}, fmt.Errorf("invalid grafana-url %q: %w", grafanaURL, err)
+	}
+	if !opts.AllowHTTP && base.Scheme != "https" {
+		return oidcDiscoveryResult{}, fmt.Errorf("grafana-url must use https for discovery: %s", grafanaURL)
+	}
+
+	loginURL, err := joinURLPath(grafanaURL, "/login")
+	if err != nil {
+		return oidcDiscoveryResult{}, err
+	}
+	current, err := url.Parse(loginURL)
+	if err != nil {
+		return oidcDiscoveryResult{}, err
+	}
+
+	discoveryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+
+	httpClient := *client
+	httpClient.Timeout = opts.Timeout
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	var (
+		foundClientID string
+		foundScopes   []string
+		candidates    []string
+		visited       = map[string]struct{}{}
+		reachedMax    = true
+	)
+
+	for step := 0; step < opts.MaxRedirects; step++ {
+		if !opts.AllowHTTP && current.Scheme != "https" {
+			return oidcDiscoveryResult{}, fmt.Errorf("discovery redirect used non-https URL: %s", current.String())
+		}
+		currentKey := current.String()
+		if _, ok := visited[currentKey]; ok {
+			return oidcDiscoveryResult{}, fmt.Errorf("discovery redirect loop detected at %s", redactURL(current.String()))
+		}
+		visited[currentKey] = struct{}{}
+		debugf("discovery step %d: GET %s", step+1, redactURL(current.String()))
+
+		clientID, scopes, issuerHint := extractHintsFromURL(current)
+		if clientID != "" && foundClientID == "" {
+			foundClientID = clientID
+			debugf("found client_id=%s", clientID)
+		}
+		if len(scopes) > 0 && len(foundScopes) == 0 {
+			foundScopes = scopes
+			debugf("found scope=%s", strings.Join(scopes, " "))
+		}
+		candidates = appendIssuerCandidate(candidates, issuerHint)
+		candidates = appendIssuerCandidate(candidates, deriveIssuerCandidateFromAuthURL(current))
+		candidates = appendIssuerCandidate(candidates, current.Scheme+"://"+current.Host)
+
+		req, err := http.NewRequestWithContext(discoveryCtx, http.MethodGet, current.String(), nil)
+		if err != nil {
+			return oidcDiscoveryResult{}, err
+		}
+		req.Header.Set("User-Agent", defaultUserAgent)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return oidcDiscoveryResult{}, fmt.Errorf("discovery request failed at %s: %w", redactURL(current.String()), err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return oidcDiscoveryResult{}, readErr
+		}
+
+		if loc := resp.Header.Get("Location"); isRedirectStatus(resp.StatusCode) && loc != "" {
+			next, err := resolveRedirectURL(current, loc)
+			if err != nil {
+				return oidcDiscoveryResult{}, err
+			}
+			debugf("redirect -> %s", redactURL(next.String()))
+			current = next
+			continue
+		}
+
+		if next, ok := parseMetaRefreshURL(current, body); ok {
+			debugf("meta refresh -> %s", redactURL(next.String()))
+			current = next
+			continue
+		}
+
+		reachedMax = false
+		break
+	}
+	if reachedMax {
+		return oidcDiscoveryResult{}, fmt.Errorf("discovery exceeded max redirect depth (%d)", opts.MaxRedirects)
+	}
+
+	issuer, meta, err := validateIssuerCandidates(discoveryCtx, &httpClient, candidates)
+	if err != nil {
+		found := []string{}
+		if foundClientID != "" {
+			found = append(found, fmt.Sprintf("client_id=%s", foundClientID))
+		}
+		if len(foundScopes) > 0 {
+			found = append(found, fmt.Sprintf("scope=%s", strings.Join(foundScopes, " ")))
+		}
+		return oidcDiscoveryResult{}, fmt.Errorf(
+			"failed to auto-discover OIDC config from %s: found %s, missing issuer_url; rerun with --issuer-url %w",
+			grafanaURL,
+			chooseNonEmpty(strings.Join(found, ", "), "none"),
+			err,
+		)
+	}
+	debugf("issuer validation succeeded via %s", issuer)
+	if foundClientID == "" {
+		return oidcDiscoveryResult{}, fmt.Errorf(
+			"failed to auto-discover OIDC config from %s: found issuer_url=%s, missing client_id; rerun with --client-id",
+			grafanaURL,
+			issuer,
+		)
+	}
+	if len(foundScopes) == 0 && meta.AuthorizationEndpoint != "" {
+		if _, scopes, _ := extractHintsFromURL(mustParseURL(meta.AuthorizationEndpoint)); len(scopes) > 0 {
+			foundScopes = scopes
+		}
+	}
+
+	return oidcDiscoveryResult{
+		IssuerURL: issuer,
+		ClientID:  foundClientID,
+		Scopes:    foundScopes,
+	}, nil
+}
+
+func validateIssuerCandidates(ctx context.Context, client *http.Client, candidates []string) (string, providerMetadata, error) {
+	seen := map[string]struct{}{}
+	for _, raw := range candidates {
+		candidate := strings.TrimSpace(strings.TrimRight(raw, "/"))
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		meta, err := discoverProviderMetadataWithClient(ctx, client, candidate)
+		if err == nil {
+			return candidate, meta, nil
+		}
+	}
+	return "", providerMetadata{}, errors.New("no candidate issuer returned a valid openid-configuration")
+}
+
+func extractHintsFromURL(u *url.URL) (clientID string, scopes []string, issuer string) {
+	if u == nil {
+		return "", nil, ""
+	}
+	q := u.Query()
+	clientID = q.Get("client_id")
+	if rawScope := q.Get("scope"); rawScope != "" {
+		scopes = splitScopes(rawScope)
+	}
+	issuer = q.Get("iss")
+	return clientID, scopes, issuer
+}
+
+func deriveIssuerCandidateFromAuthURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if u.Path == "" {
+		return u.Scheme + "://" + u.Host
+	}
+	path := strings.TrimRight(u.Path, "/")
+	suffixes := []string{
+		"/oauth2/authorize",
+		"/oauth2/v1/authorize",
+		"/oauth/authorize",
+		"/protocol/openid-connect/auth",
+		"/authorize",
+		"/auth",
+	}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(path, suffix) {
+			basePath := strings.TrimSuffix(path, suffix)
+			if basePath == "" {
+				basePath = "/"
+			}
+			return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: basePath}).String()
+		}
+	}
+	return ""
+}
+
+func appendIssuerCandidate(candidates []string, candidate string) []string {
+	if strings.TrimSpace(candidate) == "" {
+		return candidates
+	}
+	return append(candidates, candidate)
+}
+
+func resolveRedirectURL(current *url.URL, location string) (*url.URL, error) {
+	loc, err := url.Parse(strings.TrimSpace(location))
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect location %q: %w", location, err)
+	}
+	return current.ResolveReference(loc), nil
+}
+
+func isRedirectStatus(code int) bool {
+	return code >= 300 && code <= 399
+}
+
+var metaRefreshRegex = regexp.MustCompile(`(?is)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"'>]*url=([^"'>]+)`)
+
+func parseMetaRefreshURL(current *url.URL, body []byte) (*url.URL, bool) {
+	matches := metaRefreshRegex.FindSubmatch(body)
+	if len(matches) < 2 {
+		return nil, false
+	}
+	next, err := resolveRedirectURL(current, string(matches[1]))
+	if err != nil {
+		return nil, false
+	}
+	return next, true
+}
+
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	for key := range q {
+		if isSensitiveParam(key) {
+			q.Set(key, "***")
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func isSensitiveParam(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	switch k {
+	case "code", "id_token", "access_token", "refresh_token", "client_secret", "assertion", "password", "samlrequest", "samlresponse", "token":
+		return true
+	default:
+		return false
+	}
 }
 
 func loginDeviceFlow(ctx context.Context, p profileConfig, meta providerMetadata, openBrowser bool) (*storedToken, error) {
@@ -579,19 +981,23 @@ func loginAuthCodeFlow(ctx context.Context, p profileConfig, meta providerMetada
 }
 
 func discoverProviderMetadata(issuer string) (providerMetadata, error) {
+	return discoverProviderMetadataWithClient(context.Background(), http.DefaultClient, issuer)
+}
+
+func discoverProviderMetadataWithClient(ctx context.Context, client *http.Client, issuer string) (providerMetadata, error) {
 	u, err := url.Parse(issuer)
 	if err != nil {
 		return providerMetadata{}, err
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/.well-known/openid-configuration"
 
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return providerMetadata{}, err
 	}
 	req.Header.Set("User-Agent", defaultUserAgent)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return providerMetadata{}, err
 	}
@@ -770,6 +1176,16 @@ func chooseNonEmpty(first, fallback string) string {
 	return strings.TrimSpace(fallback)
 }
 
+func flagWasProvided(fs *flag.FlagSet, name string) bool {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	return provided
+}
+
 func splitScopes(v string) []string {
 	fields := strings.Fields(v)
 	if len(fields) == 0 {
@@ -788,6 +1204,14 @@ func joinURLPath(baseURL, p string) (string, error) {
 		return "", err
 	}
 	return b.ResolveReference(rel).String(), nil
+}
+
+func mustParseURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return &url.URL{}
+	}
+	return u
 }
 
 func randomURLSafe(n int) (string, error) {
