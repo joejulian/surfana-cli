@@ -554,7 +554,9 @@ func loginAuthCodeFlow(ctx context.Context, p profileConfig, meta providerMetada
 	go func() {
 		_ = srv.Serve(ln)
 	}()
-	defer srv.Shutdown(context.Background())
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+	}()
 
 	fmt.Printf("Open %s\n", authURL)
 	if openBrowser {
