@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,6 +196,63 @@ func TestDiscoverOIDCMalformedURL(t *testing.T) {
 	}, func(string, ...any) {})
 	if err == nil {
 		t.Fatal("expected malformed URL error")
+	}
+}
+
+func TestDeriveIssuerCandidateFromAuthURLOkta(t *testing.T) {
+	t.Parallel()
+
+	u, err := url.Parse("https://acme.okta.com/oauth2/default/v1/authorize?client_id=abc")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	got := deriveIssuerCandidateFromAuthURL(u)
+	want := "https://acme.okta.com/oauth2/default"
+	if got != want {
+		t.Fatalf("issuer derivation mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestDiscoverOIDCFromGrafanaSAMLFallbackToGenericOAuth(t *testing.T) {
+	t.Parallel()
+
+	var baseURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			http.Redirect(w, r, baseURL+"/sso/saml?SAMLRequest=abc", http.StatusFound)
+		case "/sso/saml":
+			w.WriteHeader(http.StatusOK)
+		case "/login/generic_oauth":
+			http.Redirect(w, r, baseURL+"/oauth2/default/v1/authorize?client_id=surfana&scope=openid+profile", http.StatusFound)
+		case "/oauth2/default/v1/authorize":
+			w.WriteHeader(http.StatusOK)
+		case "/oauth2/default/.well-known/openid-configuration":
+			_ = json.NewEncoder(w).Encode(providerMetadata{
+				Issuer:                baseURL + "/oauth2/default",
+				AuthorizationEndpoint: baseURL + "/oauth2/default/v1/authorize",
+				TokenEndpoint:         baseURL + "/oauth2/default/v1/token",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+
+	res, err := discoverOIDCFromGrafana(context.Background(), srv.Client(), baseURL, oidcDiscoveryOptions{
+		Timeout:      5 * time.Second,
+		MaxRedirects: 10,
+		AllowHTTP:    true,
+	}, func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("discoverOIDCFromGrafana returned error: %v", err)
+	}
+	if res.ClientID != "surfana" {
+		t.Fatalf("expected client_id surfana, got %q", res.ClientID)
+	}
+	if res.IssuerURL != baseURL+"/oauth2/default" {
+		t.Fatalf("expected issuer from generic_oauth path, got %q", res.IssuerURL)
 	}
 }
 

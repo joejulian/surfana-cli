@@ -93,6 +93,13 @@ type oidcDiscoveryResult struct {
 	Scopes    []string
 }
 
+type discoveryHints struct {
+	ClientID   string
+	Scopes     []string
+	Candidates []string
+	SawSAML    bool
+}
+
 type loginResolveInput struct {
 	GrafanaURL        string
 	IssuerURL         string
@@ -516,10 +523,6 @@ func discoverOIDCFromGrafana(ctx context.Context, client *http.Client, grafanaUR
 	if err != nil {
 		return oidcDiscoveryResult{}, err
 	}
-	current, err := url.Parse(loginURL)
-	if err != nil {
-		return oidcDiscoveryResult{}, err
-	}
 
 	discoveryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
@@ -530,66 +533,160 @@ func discoverOIDCFromGrafana(ctx context.Context, client *http.Client, grafanaUR
 		return http.ErrUseLastResponse
 	}
 
+	hints, err := harvestDiscoveryHints(discoveryCtx, &httpClient, loginURL, opts, debugf)
+	if err != nil {
+		return oidcDiscoveryResult{}, err
+	}
+
+	entrypoints := []string{
+		mustJoinURL(grafanaURL, "/login/generic_oauth"),
+		mustJoinURL(grafanaURL, "/login/okta"),
+		mustJoinURL(grafanaURL, "/login/oauth"),
+		mustJoinURL(grafanaURL, "/login/azuread"),
+		mustJoinURL(grafanaURL, "/login/auth0"),
+	}
+
+	for _, entry := range entrypoints {
+		if entry == "" {
+			continue
+		}
+		h, err := harvestDiscoveryHints(discoveryCtx, &httpClient, entry, opts, debugf)
+		if err != nil {
+			debugf("entrypoint %s failed: %v", redactURL(entry), err)
+			continue
+		}
+		if hints.ClientID == "" && h.ClientID != "" {
+			hints.ClientID = h.ClientID
+		}
+		if len(hints.Scopes) == 0 && len(h.Scopes) > 0 {
+			hints.Scopes = h.Scopes
+		}
+		hints.Candidates = append(hints.Candidates, h.Candidates...)
+		hints.SawSAML = hints.SawSAML || h.SawSAML
+		if hints.ClientID != "" && len(hints.Candidates) > 0 {
+			break
+		}
+	}
+
+	issuer, meta, err := validateIssuerCandidates(discoveryCtx, &httpClient, hints.Candidates)
+	if err != nil {
+		found := []string{}
+		if hints.ClientID != "" {
+			found = append(found, fmt.Sprintf("client_id=%s", hints.ClientID))
+		}
+		if len(hints.Scopes) > 0 {
+			found = append(found, fmt.Sprintf("scope=%s", strings.Join(hints.Scopes, " ")))
+		}
+		if hints.SawSAML {
+			found = append(found, "saml_redirect=true")
+		}
+		return oidcDiscoveryResult{}, fmt.Errorf(
+			"failed to auto-discover OIDC config from %s: found %s, missing issuer_url; rerun with --issuer-url (use --debug to inspect redirect chain): %w",
+			grafanaURL,
+			chooseNonEmpty(strings.Join(found, ", "), "none"),
+			err,
+		)
+	}
+	debugf("issuer validation succeeded via %s", issuer)
+	if hints.ClientID == "" {
+		extra := ""
+		if hints.SawSAML {
+			extra = " (saw SAML redirect; provide Grafana OAuth client id explicitly if your IdP hides it)"
+		}
+		return oidcDiscoveryResult{}, fmt.Errorf(
+			"failed to auto-discover OIDC config from %s: found issuer_url=%s, missing client_id; rerun with --client-id%s",
+			grafanaURL,
+			issuer,
+			extra,
+		)
+	}
+	if len(hints.Scopes) == 0 && meta.AuthorizationEndpoint != "" {
+		if _, scopes, _ := extractHintsFromURL(mustParseURL(meta.AuthorizationEndpoint)); len(scopes) > 0 {
+			hints.Scopes = scopes
+		}
+	}
+
+	return oidcDiscoveryResult{
+		IssuerURL: issuer,
+		ClientID:  hints.ClientID,
+		Scopes:    hints.Scopes,
+	}, nil
+}
+
+func harvestDiscoveryHints(ctx context.Context, client *http.Client, startURL string, opts oidcDiscoveryOptions, debugf func(string, ...any)) (discoveryHints, error) {
+	current, err := url.Parse(startURL)
+	if err != nil {
+		return discoveryHints{}, err
+	}
+
 	var (
-		foundClientID string
-		foundScopes   []string
-		candidates    []string
-		visited       = map[string]struct{}{}
-		reachedMax    = true
+		hints      discoveryHints
+		visited    = map[string]struct{}{}
+		reachedMax = true
 	)
 
 	for step := 0; step < opts.MaxRedirects; step++ {
 		if !opts.AllowHTTP && current.Scheme != "https" {
-			return oidcDiscoveryResult{}, fmt.Errorf("discovery redirect used non-https URL: %s", current.String())
+			return discoveryHints{}, fmt.Errorf("discovery redirect used non-https URL: %s", current.String())
 		}
 		currentKey := current.String()
 		if _, ok := visited[currentKey]; ok {
-			return oidcDiscoveryResult{}, fmt.Errorf("discovery redirect loop detected at %s", redactURL(current.String()))
+			return discoveryHints{}, fmt.Errorf("discovery redirect loop detected at %s", redactURL(current.String()))
 		}
 		visited[currentKey] = struct{}{}
 		debugf("discovery step %d: GET %s", step+1, redactURL(current.String()))
 
+		if looksLikeSAMLURL(current) {
+			hints.SawSAML = true
+		}
+
 		clientID, scopes, issuerHint := extractHintsFromURL(current)
-		if clientID != "" && foundClientID == "" {
-			foundClientID = clientID
+		if clientID != "" && hints.ClientID == "" {
+			hints.ClientID = clientID
 			debugf("found client_id=%s", clientID)
 		}
-		if len(scopes) > 0 && len(foundScopes) == 0 {
-			foundScopes = scopes
+		if len(scopes) > 0 && len(hints.Scopes) == 0 {
+			hints.Scopes = scopes
 			debugf("found scope=%s", strings.Join(scopes, " "))
 		}
-		candidates = appendIssuerCandidate(candidates, issuerHint)
-		candidates = appendIssuerCandidate(candidates, deriveIssuerCandidateFromAuthURL(current))
-		candidates = appendIssuerCandidate(candidates, current.Scheme+"://"+current.Host)
+		hints.Candidates = appendIssuerCandidate(hints.Candidates, issuerHint)
+		hints.Candidates = appendIssuerCandidate(hints.Candidates, deriveIssuerCandidateFromAuthURL(current))
+		hints.Candidates = appendIssuerCandidate(hints.Candidates, current.Scheme+"://"+current.Host)
 
-		req, err := http.NewRequestWithContext(discoveryCtx, http.MethodGet, current.String(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
 		if err != nil {
-			return oidcDiscoveryResult{}, err
+			return discoveryHints{}, err
 		}
 		req.Header.Set("User-Agent", defaultUserAgent)
 
-		resp, err := httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
-			return oidcDiscoveryResult{}, fmt.Errorf("discovery request failed at %s: %w", redactURL(current.String()), err)
+			return discoveryHints{}, fmt.Errorf("discovery request failed at %s: %w", redactURL(current.String()), err)
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		if readErr != nil {
-			return oidcDiscoveryResult{}, readErr
+			return discoveryHints{}, readErr
 		}
 
 		if loc := resp.Header.Get("Location"); isRedirectStatus(resp.StatusCode) && loc != "" {
 			next, err := resolveRedirectURL(current, loc)
 			if err != nil {
-				return oidcDiscoveryResult{}, err
+				return discoveryHints{}, err
 			}
 			debugf("redirect -> %s", redactURL(next.String()))
+			if looksLikeSAMLURL(next) {
+				hints.SawSAML = true
+			}
 			current = next
 			continue
 		}
 
 		if next, ok := parseMetaRefreshURL(current, body); ok {
 			debugf("meta refresh -> %s", redactURL(next.String()))
+			if looksLikeSAMLURL(next) {
+				hints.SawSAML = true
+			}
 			current = next
 			continue
 		}
@@ -597,45 +694,11 @@ func discoverOIDCFromGrafana(ctx context.Context, client *http.Client, grafanaUR
 		reachedMax = false
 		break
 	}
+
 	if reachedMax {
-		return oidcDiscoveryResult{}, fmt.Errorf("discovery exceeded max redirect depth (%d)", opts.MaxRedirects)
+		return discoveryHints{}, fmt.Errorf("discovery exceeded max redirect depth (%d)", opts.MaxRedirects)
 	}
-
-	issuer, meta, err := validateIssuerCandidates(discoveryCtx, &httpClient, candidates)
-	if err != nil {
-		found := []string{}
-		if foundClientID != "" {
-			found = append(found, fmt.Sprintf("client_id=%s", foundClientID))
-		}
-		if len(foundScopes) > 0 {
-			found = append(found, fmt.Sprintf("scope=%s", strings.Join(foundScopes, " ")))
-		}
-		return oidcDiscoveryResult{}, fmt.Errorf(
-			"failed to auto-discover OIDC config from %s: found %s, missing issuer_url; rerun with --issuer-url %w",
-			grafanaURL,
-			chooseNonEmpty(strings.Join(found, ", "), "none"),
-			err,
-		)
-	}
-	debugf("issuer validation succeeded via %s", issuer)
-	if foundClientID == "" {
-		return oidcDiscoveryResult{}, fmt.Errorf(
-			"failed to auto-discover OIDC config from %s: found issuer_url=%s, missing client_id; rerun with --client-id",
-			grafanaURL,
-			issuer,
-		)
-	}
-	if len(foundScopes) == 0 && meta.AuthorizationEndpoint != "" {
-		if _, scopes, _ := extractHintsFromURL(mustParseURL(meta.AuthorizationEndpoint)); len(scopes) > 0 {
-			foundScopes = scopes
-		}
-	}
-
-	return oidcDiscoveryResult{
-		IssuerURL: issuer,
-		ClientID:  foundClientID,
-		Scopes:    foundScopes,
-	}, nil
+	return hints, nil
 }
 
 func validateIssuerCandidates(ctx context.Context, client *http.Client, candidates []string) (string, providerMetadata, error) {
@@ -679,6 +742,7 @@ func deriveIssuerCandidateFromAuthURL(u *url.URL) string {
 	}
 	path := strings.TrimRight(u.Path, "/")
 	suffixes := []string{
+		"/v1/authorize",
 		"/oauth2/authorize",
 		"/oauth2/v1/authorize",
 		"/oauth/authorize",
@@ -703,6 +767,18 @@ func appendIssuerCandidate(candidates []string, candidate string) []string {
 		return candidates
 	}
 	return append(candidates, candidate)
+}
+
+func looksLikeSAMLURL(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	q := u.Query()
+	if q.Get("SAMLRequest") != "" || q.Get("SAMLResponse") != "" || q.Get("samlrequest") != "" || q.Get("samlresponse") != "" {
+		return true
+	}
+	path := strings.ToLower(u.Path)
+	return strings.Contains(path, "saml")
 }
 
 func resolveRedirectURL(current *url.URL, location string) (*url.URL, error) {
@@ -1204,6 +1280,14 @@ func joinURLPath(baseURL, p string) (string, error) {
 		return "", err
 	}
 	return b.ResolveReference(rel).String(), nil
+}
+
+func mustJoinURL(baseURL, p string) string {
+	out, err := joinURLPath(baseURL, p)
+	if err != nil {
+		return ""
+	}
+	return out
 }
 
 func mustParseURL(raw string) *url.URL {
